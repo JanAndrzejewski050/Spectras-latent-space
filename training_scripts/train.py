@@ -222,6 +222,7 @@ def compute_loss(pred, target, mu, logvar, step, total_steps, args, balancer):
 
 
 def load_data(args):
+    print('loading dfs')
     data_dir = Path('/home/andrze06/projects/Spectras-latent-space/data/multimodal_spectroscopic_dataset')
     files = sorted(data_dir.glob("aligned_chunk_*.parquet"))
     dfs = [pd.read_parquet(f, columns=['smiles', 'c_nmr_spectra', 'h_nmr_spectra', 'msms_cfmid_positive_20ev']) for f in files]
