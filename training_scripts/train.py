@@ -1,5 +1,6 @@
 import argparse
 import os
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,13 +8,15 @@ import wandb
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import pandas as pd
-import pathlib
-from pathlib import Path
-import numpy as np
 from scipy.ndimage import gaussian_filter1d
-from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+
+MODALITY_NAMES = ["c_nmr", "h_nmr", "ms"]
 
 
 def parse_args():
@@ -39,12 +42,14 @@ def parse_args():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--epochs", type=int, default=400)
+    p.add_argument("--epochs", type=int, default=1000)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--patience", type=int, default=30)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--amp", action="store_true", default=True)
     p.add_argument("--no_amp", dest="amp", action="store_false")
+
+    p.add_argument("--plot_every", type=int, default=10)
 
     p.add_argument("--wandb_project", type=str, default="spectra-vae")
     p.add_argument("--wandb_entity", type=str, default=None)
@@ -219,6 +224,63 @@ def compute_loss(pred, target, mu, logvar, step, total_steps, args, balancer):
     logs.update({f"w_{k}": v for k, v in weights.items()})
     return total, logs
 
+
+@torch.no_grad()
+def evaluate_metrics(pred, target, kernel=5, eps=1e-6):
+    peak_mask = (target > eps).float()
+    n_peak = peak_mask.sum().clamp_min(1.0)
+
+    mse_full = F.mse_loss(pred, target).item()
+    mse_peaks = (((pred - target) ** 2 * peak_mask).sum() / n_peak).item()
+    peak_weighted_mse = (((pred - target) ** 2 * target).sum() / target.sum().clamp_min(eps)).item()
+
+    pred_flat, target_flat = pred.flatten(1), target.flatten(1)
+    pc = pred_flat - pred_flat.mean(dim=1, keepdim=True)
+    tc = target_flat - target_flat.mean(dim=1, keepdim=True)
+    corr = ((pc * tc).sum(dim=1) / (pc.norm(dim=1) * tc.norm(dim=1) + eps)).mean().item()
+
+    pooled = F.max_pool1d(target, kernel, stride=1, padding=kernel // 2)
+    is_peak = (target == pooled) & (target > eps)
+    if is_peak.sum() > 0:
+        pred_pk, target_pk = pred[is_peak], target[is_peak]
+        peak_rel_err = ((pred_pk - target_pk).abs() / target_pk.clamp_min(eps)).mean().item()
+    else:
+        peak_rel_err = 0.0
+
+    mass_ratio = (pred.sum() / target.sum().clamp_min(eps)).item()
+
+    metrics = {
+        "mse_full": mse_full,
+        "mse_peaks": mse_peaks,
+        "peak_weighted_mse": peak_weighted_mse,
+        "corr": corr,
+        "peak_rel_err": peak_rel_err,
+        "mass_ratio": mass_ratio,
+    }
+
+    for i, name in enumerate(MODALITY_NAMES):
+        p_c, t_c = pred[:, i], target[:, i]
+        m_c = (t_c > eps).float()
+        metrics[f"mse_peaks_{name}"] = ((p_c - t_c) ** 2 * m_c).sum().item() / m_c.sum().clamp_min(1.0).item()
+        metrics[f"mass_ratio_{name}"] = (p_c.sum() / t_c.sum().clamp_min(eps)).item()
+
+    return metrics
+
+
+@torch.no_grad()
+def make_reconstruction_plot(x, x_pred, idx=0):
+    fig, axes = plt.subplots(len(MODALITY_NAMES), 1, figsize=(10, 6))
+    for i, name in enumerate(MODALITY_NAMES):
+        axes[i].plot(x[idx, i].cpu().numpy(), label="target", alpha=0.7)
+        axes[i].plot(x_pred[idx, i].cpu().numpy(), label="pred", alpha=0.7)
+        axes[i].set_title(name)
+        axes[i].legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    img = wandb.Image(fig)
+    plt.close(fig)
+    return img
+
+
 def load_data(args):
     print("loading dfs")
 
@@ -244,9 +306,6 @@ def load_data(args):
     MAX_MZ = 1100.0
     MS_BINS = 10000
 
-    ####################################################################
-    # Efficient MS conversion (no temporary arrays)
-    ####################################################################
 
     def ms_to_dense(ms_peaks, bins=MS_BINS, max_mz=MAX_MZ):
 
@@ -270,26 +329,14 @@ def load_data(args):
 
         return spectrum
 
-    ####################################################################
-    # Keep raw lists only
-    ####################################################################
-
     c_nmr_data = df["c_nmr_spectra"].to_list()
     h_nmr_data = df["h_nmr_spectra"].to_list()
     ms_raw = df["msms_cfmid_positive_20ev"].to_list()
 
     del df
 
-    ####################################################################
-    # Maxima
-    ####################################################################
-
     c_max = max(float(x.max()) for x in c_nmr_data)
     h_max = max(float(x.max()) for x in h_nmr_data)
-
-    ####################################################################
-    # Compute MS statistics WITHOUT storing dense spectra
-    ####################################################################
 
     ms_max = 0.0
     ms_sum = 0.0
@@ -316,10 +363,6 @@ def load_data(args):
     ms_mean = ms_sum / ms_n
     ms_std = np.sqrt(ms_sum2 / ms_n - ms_mean ** 2)
 
-    ####################################################################
-    # C/H statistics
-    ####################################################################
-
     def peak_stats(spectra, threshold=THRESHOLD):
 
         s = 0.0
@@ -344,10 +387,6 @@ def load_data(args):
 
     c_mean, c_std = peak_stats(c_nmr_data)
     h_mean, h_std = peak_stats(h_nmr_data)
-
-    ####################################################################
-    # Dataset
-    ####################################################################
 
     class SpectraDataset(Dataset):
 
@@ -376,10 +415,6 @@ def load_data(args):
 
             return torch.from_numpy(x)
 
-    ####################################################################
-    # Split
-    ####################################################################
-
     idx = np.arange(len(c_nmr_data))
 
     train_idx, dummy_idx = train_test_split(
@@ -397,7 +432,7 @@ def load_data(args):
     train_data = SpectraDataset(c_nmr_data, h_nmr_data, ms_raw, train_idx)
     val_data = SpectraDataset(c_nmr_data, h_nmr_data, ms_raw, val_idx)
 
-    return train_data, val_data, train_data[0].shape[0]
+    return train_data, val_data, train_data[0].shape[1]
 
 
 def main():
@@ -434,7 +469,7 @@ def main():
     wandb.watch(model, log="gradients", log_freq=200)
 
     global_step = 0
-    best_val_loss = float("inf")
+    best_metric = float("inf")
     patience_counter = 0
 
     for epoch in range(args.epochs):
@@ -466,24 +501,40 @@ def main():
 
         model.eval()
         val_loss = 0.0
+        eval_accum = {}
+        plot_img = None
         with torch.no_grad():
-            for x in val_loader:
+            for i, x in enumerate(val_loader):
                 x = x.to(device, non_blocking=True)
                 with torch.cuda.amp.autocast(enabled=args.amp):
                     x_pred, mu, logvar = model(x)
                     loss, _ = compute_loss(x_pred, x, mu, logvar, global_step, total_steps, args, balancer)
                 val_loss += loss.item()
 
+                metrics = evaluate_metrics(x_pred.float(), x.float(), kernel=args.peak_kernel)
+                for k, v in metrics.items():
+                    eval_accum[k] = eval_accum.get(k, 0) + v
+
+                if i == 0 and epoch % args.plot_every == 0:
+                    plot_img = make_reconstruction_plot(x.float(), x_pred.float())
+
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
         logs_accum = {k: v / len(train_loader) for k, v in logs_accum.items()}
+        eval_accum = {f"eval/{k}": v / len(val_loader) for k, v in eval_accum.items()}
 
         wandb.log({"train_loss": train_loss, "val_loss": val_loss,
-                    "lr": scheduler.get_last_lr()[0], "epoch": epoch, **logs_accum}, step=global_step)
-        print(f"epoch {epoch:03d} | train={train_loss:.4f} | val={val_loss:.4f}")
+                    "lr": scheduler.get_last_lr()[0], "epoch": epoch,
+                    **logs_accum, **eval_accum}, step=global_step)
+        if plot_img is not None:
+            wandb.log({"reconstruction": plot_img}, step=global_step)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        target_metric = eval_accum["eval/peak_weighted_mse"]
+        print(f"epoch {epoch:03d} | train={train_loss:.4f} | val={val_loss:.4f} | "
+              f"peak_weighted_mse={target_metric:.4f}")
+
+        if target_metric < best_metric:
+            best_metric = target_metric
             patience_counter = 0
             torch.save({"model": model.state_dict(), "args": vars(args)},
                        os.path.join(args.ckpt_dir, f"{run.id}_best.pt"))
