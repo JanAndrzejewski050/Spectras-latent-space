@@ -219,115 +219,183 @@ def compute_loss(pred, target, mu, logvar, step, total_steps, args, balancer):
     logs.update({f"w_{k}": v for k, v in weights.items()})
     return total, logs
 
-
-
 def load_data(args):
-    print('loading dfs')
-    data_dir = Path('/home/andrze06/projects/Spectras-latent-space/data/multimodal_spectroscopic_dataset')
+    print("loading dfs")
+
+    data_dir = Path("/home/andrze06/projects/Spectras-latent-space/data/multimodal_spectroscopic_dataset")
     files = sorted(data_dir.glob("aligned_chunk_*.parquet"))
-    dfs = [pd.read_parquet(f, columns=['smiles', 'c_nmr_spectra', 'h_nmr_spectra', 'msms_cfmid_positive_20ev']) for f in files]
+
+    dfs = [
+        pd.read_parquet(
+            f,
+            columns=[
+                "smiles",
+                "c_nmr_spectra",
+                "h_nmr_spectra",
+                "msms_cfmid_positive_20ev",
+            ],
+        )
+        for f in files
+    ]
+
     df = pd.concat(dfs, ignore_index=True)
 
-    MS_BINS = 10000
-    MAX_MZ = 1100.0        # typical MS range
-    LOG_SCALE = False      # optional
     THRESHOLD = 1e-4
+    MAX_MZ = 1100.0
+    MS_BINS = 10000
 
-    def ms_to_dense(ms_peaks, bins=10000, max_mz=1000):
+    ####################################################################
+    # Efficient MS conversion (no temporary arrays)
+    ####################################################################
+
+    def ms_to_dense(ms_peaks, bins=MS_BINS, max_mz=MAX_MZ):
 
         spectrum = np.zeros(bins, dtype=np.float32)
 
         if ms_peaks is None or len(ms_peaks) == 0:
             return spectrum
 
-        peaks = np.array([np.asarray(p, dtype=np.float32) for p in ms_peaks])
+        scale = (bins - 1) / max_mz
 
-        mz = peaks[:, 0]
-        intensity = peaks[:, 1]
+        for mz, intensity in ms_peaks:
+            idx = int(mz * scale)
 
-        idx = np.clip(
-            (mz / max_mz * (bins - 1)).astype(np.int32),
-            0,
-            bins - 1,
-        )
+            if idx < 0:
+                idx = 0
+            elif idx >= bins:
+                idx = bins - 1
 
-        np.maximum.at(spectrum, idx, intensity)
+            if intensity > spectrum[idx]:
+                spectrum[idx] = intensity
 
         return spectrum
 
-    df["ms_spectra"] = [
-        ms_to_dense(x)
-        for x in tqdm(df["msms_cfmid_positive_20ev"])
-    ]
+    ####################################################################
+    # Keep raw lists only
+    ####################################################################
 
-    ms_spectra = df['ms_spectra'].to_list()
-    c_nmr_data = df['c_nmr_spectra'].to_list()
-    h_nmr_data = df['h_nmr_spectra'].to_list()
+    c_nmr_data = df["c_nmr_spectra"].to_list()
+    h_nmr_data = df["h_nmr_spectra"].to_list()
+    ms_raw = df["msms_cfmid_positive_20ev"].to_list()
 
-    c_max = max(np.max(x) for x in c_nmr_data)
-    h_max = max(np.max(x) for x in h_nmr_data)
-    ms_max = max(np.max(x) for x in ms_spectra)
+    del df
 
-    ms = gaussian_filter1d(ms_spectra, sigma=2.5)
+    ####################################################################
+    # Maxima
+    ####################################################################
+
+    c_max = max(float(x.max()) for x in c_nmr_data)
+    h_max = max(float(x.max()) for x in h_nmr_data)
+
+    ####################################################################
+    # Compute MS statistics WITHOUT storing dense spectra
+    ####################################################################
+
+    ms_max = 0.0
+    ms_sum = 0.0
+    ms_sum2 = 0.0
+    ms_n = 0
+
+    print("Computing MS statistics...")
+
+    for peaks in tqdm(ms_raw):
+
+        spec = gaussian_filter1d(ms_to_dense(peaks), sigma=2.5)
+
+        ms_max = max(ms_max, float(spec.max()))
+
+        p = spec[spec > THRESHOLD]
+
+        if p.size == 0:
+            continue
+
+        ms_sum += p.sum(dtype=np.float64)
+        ms_sum2 += np.square(p, dtype=np.float64).sum(dtype=np.float64)
+        ms_n += p.size
+
+    ms_mean = ms_sum / ms_n
+    ms_std = np.sqrt(ms_sum2 / ms_n - ms_mean ** 2)
+
+    ####################################################################
+    # C/H statistics
+    ####################################################################
 
     def peak_stats(spectra, threshold=THRESHOLD):
+
         s = 0.0
         s2 = 0.0
         n = 0
 
         for spec in tqdm(spectra):
-            peaks = spec[spec > threshold]
 
-            if len(peaks) == 0:
+            p = spec[spec > threshold]
+
+            if p.size == 0:
                 continue
 
-            s += peaks.sum(dtype=np.float64)
-            s2 += np.square(peaks, dtype=np.float64).sum(dtype=np.float64)
-            n += len(peaks)
+            s += p.sum(dtype=np.float64)
+            s2 += np.square(p, dtype=np.float64).sum(dtype=np.float64)
+            n += p.size
 
         mean = s / n
-        std = np.sqrt(s2 / n - mean**2)
+        std = np.sqrt(s2 / n - mean ** 2)
 
         return mean, std
 
     c_mean, c_std = peak_stats(c_nmr_data)
     h_mean, h_std = peak_stats(h_nmr_data)
-    ms_mean, ms_std = peak_stats(ms)
+
+    ####################################################################
+    # Dataset
+    ####################################################################
 
     class SpectraDataset(Dataset):
-        def __init__(self, c_nmr, h_nmr, ms, c_max, h_max, ms_max, indices, scale=1e4):
+
+        def __init__(self, c_nmr, h_nmr, ms_raw, indices):
+
             self.c_nmr = c_nmr
             self.h_nmr = h_nmr
-            self.ms = ms
-            self.c_max = c_max
-            self.h_max = h_max
-            self.ms_max = ms_max
+            self.ms_raw = ms_raw
             self.indices = indices
-            self.scale = scale
 
         def __len__(self):
             return len(self.indices)
 
         def __getitem__(self, idx):
+
             i = self.indices[idx]
 
-            # c = normalize_peaks(self.c_nmr[idx], c_mean, c_std)
-            # h = normalize_peaks(self.h_nmr[idx], h_mean, h_std)
-            # ms = normalize_peaks(self.ms[idx], ms_mean, ms_std)
-            c = self.c_nmr[i] / (c_std)#np.log1p((self.c_nmr[i] / self.c_max) * self.scale) #
-            h = self.h_nmr[i] / (h_std)#np.log1p((self.h_nmr[i] / self.h_max) * self.scale) #
-            ms = self.ms[i] / (ms_std)#np.log1p((self.ms[i] / self.ms_max) * self.scale) #
+            c = self.c_nmr[i] / c_std
+            h = self.h_nmr[i] / h_std
+
+            ms = ms_to_dense(self.ms_raw[i])
+            ms = gaussian_filter1d(ms, sigma=2.5)
+            ms = ms / ms_std
 
             x = np.stack((c, h, ms), axis=0).astype(np.float32)
-            return torch.from_numpy(x)  
+
+            return torch.from_numpy(x)
+
+    ####################################################################
+    # Split
+    ####################################################################
 
     idx = np.arange(len(c_nmr_data))
-    train_idx, dummy_idx = train_test_split(idx, test_size=0.2, random_state=42)
-    val_idx, test_idx = train_test_split(dummy_idx, test_size=0.5, random_state=42)
 
-    train_data = SpectraDataset(c_nmr_data, h_nmr_data, ms, c_max, h_max, ms_max, train_idx)
-    val_data = SpectraDataset(c_nmr_data, h_nmr_data, ms, c_max, h_max, ms_max, val_idx)
-    test_data = SpectraDataset(c_nmr_data, h_nmr_data, ms, c_max, h_max, ms_max, test_idx)
+    train_idx, dummy_idx = train_test_split(
+        idx,
+        test_size=0.2,
+        random_state=42,
+    )
+
+    val_idx, test_idx = train_test_split(
+        dummy_idx,
+        test_size=0.5,
+        random_state=42,
+    )
+
+    train_data = SpectraDataset(c_nmr_data, h_nmr_data, ms_raw, train_idx)
+    val_data = SpectraDataset(c_nmr_data, h_nmr_data, ms_raw, val_idx)
 
     return train_data, val_data, train_data[0].shape[0]
 
